@@ -2,21 +2,25 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"log"
+	"go/doc"
 	"sort"
-	"strconv"
+	"strings"
 	"sync"
 
 	stderrors "errors"
 	stdpath "path"
 
 	"github.com/diamondburned/gotk4/gir/girgen/strcases"
+	"github.com/hashicorp/go-hclog"
 	"github.com/pb33f/libopenapi"
 	"github.com/pkg/errors"
 	"github.com/sourcegraph/conc/pool"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/slices"
+	"libdb.so/arikawa-generator/internal/cmt"
+	"libdb.so/arikawa-generator/internal/docread"
 
 	openapibase "github.com/pb33f/libopenapi/datamodel/high/base"
 )
@@ -26,6 +30,8 @@ type generateState struct {
 	generated  map[string]struct{}
 	errors     []error
 	errorCount int
+
+	ctx context.Context
 }
 
 func (e *generateState) addError(err error) {
@@ -38,22 +44,6 @@ func (e *generateState) addError(err error) {
 	}
 }
 
-func (e *generateState) markGenerated(name string) (shouldGenerate bool) {
-	e.Lock()
-	defer e.Unlock()
-
-	if e.generated == nil {
-		e.generated = make(map[string]struct{})
-	}
-
-	if _, ok := e.generated[name]; ok {
-		return false
-	}
-
-	e.generated[name] = struct{}{}
-	return true
-}
-
 const primitives = `
 // Optional is a type alias for optional values.
 //
@@ -63,24 +53,25 @@ const primitives = `
 // that the type might not be a pointer anymore. Because of this, it is
 // recommended to use the methods provided by this package to interact with
 // this type.
-type Optional[T any] *T
+type Optional[T any] *struct{ v T }
 
-// NewValue returns an optional value from a non-nil value.
-func NewValue[T any](v T) Optional[T] { return Optional[T](&v) }
+// Some returns an optional value from a non-nil value.
+func Some[T any](v T) Optional[T] { return Optional[T]{v} }
 
 // None returns a nil optional value.
 func None[T any]() Optional[T] { return nil }
 
 // Unwrap returns the value of the optional, or panics if the optional is nil.
-func (o Optional) Unwrap() T {
+func (o Optional[T]) Unwrap() T {
 	if o == nil {
-		panic("attempted to unwrap nil Optional")
+		t := reflect.TypeOf((*T)(nil)).Elem().String()
+		panic("attempted to unwrap nil Optional[" + t + "]")
 	}
-	return *o
+	return o.v
 }
 
 // IsNone returns true if the optional is nil.
-func (o Optional) IsNone() bool { return o == nil }
+func (o Optional[T]) IsNone() bool { return o == nil }
 
 // PtrTo returns a pointer to the given value.
 func PtrTo[T any](v T) *T { return &v }
@@ -99,7 +90,15 @@ func Generate(doc libopenapi.Document, pkgName string) ([]byte, error) {
 	buf.WriteString("package " + pkgName + "\n\n")
 	buf.WriteString(primitives)
 
-	state := &generateState{}
+	state := &generateState{ctx: context.TODO()}
+
+	// Trim off "Response" if there's no collision.
+	for name, schema := range v3doc.Model.Components.Schemas {
+		name = strings.TrimSuffix(name, "Response")
+		if _, ok := v3doc.Model.Components.Schemas[name]; !ok {
+			v3doc.Model.Components.Schemas[name] = schema
+		}
+	}
 
 	schemaBytes := parallelMapAttrs(v3doc.Model.Components.Schemas,
 		func(name string, proxy *openapibase.SchemaProxy) []byte {
@@ -138,24 +137,26 @@ func (g *generator) error(err error) {
 	}
 }
 
-func (g *generator) skip(what string, why ...any) {
-	if what != "" {
-		what = strconv.Quote(what)
-	} else {
-		what = "<anonymous>"
-	}
-	log.Printf("skipping %s: %s", what, fmt.Sprintln(why...))
+func (g *generator) captured(f func(*generator)) string {
+	g2 := &generator{output: new(bytes.Buffer), state: g.state}
+	f(g2)
+	return g2.output.String()
 }
+
+const (
+	pathSchemas   = "#/components/schemas"
+	pathResponses = "#/components/responses"
+)
 
 func (g *generator) generateSchema(path schemaPath) error {
 	proxy := path.CurrentProxy()
 	if proxy.IsReference() {
 		switch ref := proxy.GetReference(); stdpath.Dir(ref) {
-		case "#/components/schemas":
+		case pathSchemas:
 			name := stdpath.Base(ref)
 			fmt.Fprintf(g.output, "%s", pascalToGo(name))
 			return nil
-		case "#/components/responses":
+		case pathResponses:
 			return nil // TODO
 		default:
 			return fmt.Errorf("unknown reference %q", ref)
@@ -164,37 +165,71 @@ func (g *generator) generateSchema(path schemaPath) error {
 
 	schema := path.Current()
 
-	var primaryType string
-	switch len(schema.Type) {
-	case 1:
-		primaryType = schema.Type[0]
-	case 2:
-		nullIx := slices.Index(schema.Type, "null")
-		if nullIx == -1 {
-			return fmt.Errorf("schema %s has more than one type: %q", path, schema.Type)
-		}
-
-		fmt.Fprintf(g.output, "*")
-		primaryType = schema.Type[1-nullIx]
-	default:
-		if len(schema.Type) > 0 {
-			return fmt.Errorf("schema %s has more than one type: %q", path, schema.Type)
-		}
+	ptype, err := extractPrimaryType(schema.Type)
+	if err != nil {
+		return fmt.Errorf("schema %s has invalid type: %v", path, err)
 	}
 
-	switch primaryType {
+	if ptype.Nullable {
+		fmt.Fprintf(g.output, "*")
+	}
+
+	switch ptype.Type {
 	case "object":
+		var docCandidateFields map[string]docread.FieldInfo
+		// if candidates := calculateTopLikelihood(path, schema); len(candidates) > 0 {
+		// 	topCandidate := candidates[0]
+		// 	docCandidateFields = docread.ToFieldMap(topCandidate.FieldInfos())
+		// }
+
 		fmt.Fprintf(g.output, "struct {\n")
 
-		propertiesIter := orderedMap(schema.Properties)
-		propertiesIter(func(name string, proxy *openapibase.SchemaProxy) bool {
-			fmt.Fprintf(g.output, "\t%s ", snakeToGo(name))
+		propertyNames := make([]string, 0, len(schema.Properties))
+		for name := range schema.Properties {
+			propertyNames = append(propertyNames, name)
+		}
 
+		// This OpenAPI library is very funny in the sense that everything we
+		// can use actually contains line numbers. So we can sort the properties
+		// by line number and get deterministic output.
+		propertyLines := make(map[string]int, len(propertyNames))
+		for _, name := range propertyNames {
+			lowProperty := schema.GoLow().FindProperty(name)
+			propertyLines[name] = lowProperty.ValueNode.Line
+		}
+		sort.Slice(propertyNames, func(i, j int) bool {
+			return propertyLines[propertyNames[i]] < propertyLines[propertyNames[j]]
+		})
+
+		for _, name := range propertyNames {
+			proxy := schema.Properties[name]
 			optional := !slices.Contains(schema.Required, name)
+
+			docField, ok := docCandidateFields[name]
+			if ok {
+				indent := len(path) - 1
+				comment := cmt.Prettify(snakeToGo(name), docField.Comment, cmt.Opts{
+					OriginalName: name,
+				})
+				fmt.Fprintf(g.output, "%s", wrapComment(comment, indent))
+			}
+
+			fmt.Fprintf(g.output, "\t%s ", snakeToGo(name))
 			if optional {
 				fmt.Fprintf(g.output, "Optional[")
 			}
-			g.error(g.generateSchema(path.Push(name, proxy)))
+
+			t := g.captured(func(g *generator) {
+				g.error(g.generateSchema(path.Push(name, proxy)))
+			})
+
+			if optional {
+				// Remove pointer from type if the type is already optional.
+				t = strings.TrimPrefix(t, "*")
+			}
+
+			g.output.WriteString(t)
+
 			if optional {
 				fmt.Fprintf(g.output, "]")
 			}
@@ -205,17 +240,36 @@ func (g *generator) generateSchema(path schemaPath) error {
 			}
 			fmt.Fprintf(g.output, " `json:%q`", jsonKey)
 			fmt.Fprintln(g.output)
-			return true
-		})
+		}
 
 		fmt.Fprintf(g.output, "}")
+		return nil
+	case "array":
+		if !schema.Items.IsA() {
+			return fmt.Errorf("schema %s has array type but no items", path)
+		}
+		fmt.Fprintf(g.output, "[]")
+		g.error(g.generateSchema(path.Push("[]", schema.Items.A)))
 		return nil
 	case "string":
 		return g.generateString(path)
 	case "integer":
-		intType := "int"
-		if schema.Format != "" {
+		var intType string
+		if len(schema.AllOf) == 1 && schema.AllOf[0].IsReference() {
+			ref := schema.AllOf[0].GetReference()
+			if stdpath.Dir(ref) == pathSchemas {
+				intType = pascalToGo(stdpath.Base(ref))
+			}
+		}
+		if intType == "" && path.CurrentName() == "type" {
+			log := hclog.FromContext(g.state.ctx)
+			log.Warn("type is integer but should be enum", "path", path)
+		}
+		if intType == "" && schema.Format != "" {
 			intType = schema.Format
+		}
+		if intType == "" {
+			intType = "int"
 		}
 		fmt.Fprintf(g.output, "%s", intType)
 		return nil
@@ -233,17 +287,17 @@ func (g *generator) generateSchema(path schemaPath) error {
 	// TODO: generate Validate() if !opts.anonymous
 
 	switch {
-	case schema.AllOf != nil:
-		return g.generateAllOf(path, schema.AllOf)
-	case schema.AnyOf != nil:
-		return g.generateAnyOf(path, schema.AnyOf)
-	case schema.OneOf != nil:
-		return g.generateOneOf(path, schema.OneOf)
+	// case schema.AllOf != nil:
+	// 	return g.generateAllOf(path, schema.AllOf)
+	// case schema.AnyOf != nil:
+	// 	return g.generateAnyOf(path, schema.AnyOf)
+	// case schema.OneOf != nil:
+	// 	return g.generateOneOf(path, schema.OneOf)
 	case schema.Not != nil:
 		return fmt.Errorf("unsupported 'not' schema %s", path)
 	}
 
-	fmt.Fprintf(g.output, "struct{ /* unsupported %q (%s) */ }", path, schema.Type)
+	fmt.Fprintf(g.output, "struct{ /* %v */ }", schema.Type)
 	return nil
 }
 
@@ -251,10 +305,7 @@ func (g *generator) generateString(path schemaPath) error {
 	schema := path.Current()
 	switch schema.Format {
 	case "snowflake":
-		log.Println("snowflake type has field name", path.CurrentName())
-		log.Println("snowflake type has parent name", path.Parent().CurrentName())
-
-		fmt.Fprintf(g.output, "Snowflake")
+		fmt.Fprintf(g.output, "%s", g.guessSnowflake(path))
 	case "date-time":
 		fmt.Fprintf(g.output, "time.Time")
 	default:
@@ -262,6 +313,75 @@ func (g *generator) generateString(path schemaPath) error {
 	}
 
 	return nil
+}
+
+func wrapComment(text string, level int) string {
+	indentWidth := level*4 + len("// ")
+	indentStr := strings.Repeat(" ", indentWidth)
+	indentStr += "// "
+
+	var s strings.Builder
+	doc.ToText(&s, text, indentStr, "    ", 80-indentWidth)
+	return s.String()
+}
+
+type primaryType struct {
+	Type     string
+	Nullable bool
+}
+
+func extractPrimaryType(types []string) (primaryType, error) {
+	switch len(types) {
+	case 0:
+		return primaryType{}, nil
+	case 1:
+		return primaryType{Type: types[0]}, nil
+	case 2:
+		nullIx := slices.Index(types, "null")
+		if nullIx == -1 {
+			return primaryType{}, errors.New("schema has more than one type")
+		}
+		return primaryType{Type: types[1-nullIx], Nullable: true}, nil
+	default:
+		return primaryType{}, errors.New("schema has more than one type")
+	}
+}
+
+func (g *generator) guessSnowflake(path schemaPath) string {
+	if path.CurrentName() == "[]" {
+		// skip
+		path = path.Parent()
+	}
+
+	kind, ok := snowflakeFields[path.String()]
+	if ok {
+		return kind + "ID"
+	}
+
+	fieldName := snakeToGo(path.CurrentName())
+	parentName := pascalToGo(path.Parent().CurrentName())
+
+	for kind := range snowflakes {
+		if false ||
+			(kind+"ID" == fieldName) ||
+			(kind+"IDs" == fieldName) ||
+			(strings.HasSuffix(fieldName, kind)) ||
+			(strings.HasSuffix(fieldName, kind+"s")) ||
+			(strings.HasSuffix(fieldName, kind+"ID")) ||
+			(strings.HasSuffix(fieldName, kind+"IDs")) ||
+			(fieldName == "ID" && strings.HasPrefix(parentName, kind)) {
+
+			return kind + "ID"
+		}
+	}
+
+	log := hclog.FromContext(g.state.ctx)
+	log.Debug("unknown snowflake field",
+		"path", path.String(),
+		"field", fieldName,
+		"parent", parentName)
+
+	return "Snowflake"
 }
 
 func (g *generator) generateAllOf(path schemaPath, proxies []*openapibase.SchemaProxy) error {
