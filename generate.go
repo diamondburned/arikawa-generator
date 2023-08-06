@@ -19,7 +19,9 @@ import (
 	"github.com/sourcegraph/conc/pool"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/exp/slices"
+	"gopkg.in/yaml.v3"
 	"libdb.so/arikawa-generator/internal/cmt"
+	"libdb.so/arikawa-generator/internal/darkfuckingmagic"
 	"libdb.so/arikawa-generator/internal/docread"
 
 	openapibase "github.com/pb33f/libopenapi/datamodel/high/base"
@@ -148,6 +150,8 @@ const (
 	pathResponses = "#/components/responses"
 )
 
+var enumNames = NewSet("type", "flags")
+
 func (g *generator) generateSchema(path schemaPath) error {
 	proxy := path.CurrentProxy()
 	if proxy.IsReference() {
@@ -194,8 +198,9 @@ func (g *generator) generateSchema(path schemaPath) error {
 		// by line number and get deterministic output.
 		propertyLines := make(map[string]int, len(propertyNames))
 		for _, name := range propertyNames {
-			lowProperty := schema.GoLow().FindProperty(name)
-			propertyLines[name] = lowProperty.ValueNode.Line
+			lowProperty := schema.Properties[name].GoLow()
+			propKeyNode := darkfuckingmagic.UnexportedField[*yaml.Node](lowProperty, "kn")
+			propertyLines[name] = propKeyNode.Line
 		}
 		sort.Slice(propertyNames, func(i, j int) bool {
 			return propertyLines[propertyNames[i]] < propertyLines[propertyNames[j]]
@@ -261,9 +266,9 @@ func (g *generator) generateSchema(path schemaPath) error {
 				intType = pascalToGo(stdpath.Base(ref))
 			}
 		}
-		if intType == "" && path.CurrentName() == "type" {
+		if intType == "" && enumNames.Has(path.CurrentName()) {
 			log := hclog.FromContext(g.state.ctx)
-			log.Warn("type is integer but should be enum", "path", path)
+			log.Warn(path.CurrentName()+" is integer but should be enum", "path", path.String())
 		}
 		if intType == "" && schema.Format != "" {
 			intType = schema.Format
