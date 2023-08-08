@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	_ "embed"
@@ -19,10 +20,12 @@ import (
 var (
 	outputFile          = "-"
 	outputPkg           = "main"
+	optionPkg           = "libdb.so/arikawa-generator/option"
 	openapiFile         = filepath.Join(os.Getenv("DISCORD_API_SPEC"), "specs", "openapi.json")
 	documentationDir    = filepath.Join(os.Getenv("DISCORD_API_DOCS"), "docs", "resources")
 	initialsFile        string
 	snowflakeFieldsFile string
+	numWorkers          = runtime.GOMAXPROCS(-1)
 )
 
 func init() {
@@ -30,10 +33,12 @@ func init() {
 
 	flag.StringVar(&outputFile, "o", outputFile, "output file")
 	flag.StringVar(&outputPkg, "pkg", outputPkg, "output package")
+	flag.StringVar(&optionPkg, "option-pkg", optionPkg, "option package")
 	flag.StringVar(&openapiFile, "openapi", openapiFile, "openapi file")
 	flag.StringVar(&documentationDir, "docs", documentationDir, "documentation directory")
 	flag.StringVar(&initialsFile, "initials", initialsFile, "initials file")
 	flag.StringVar(&snowflakeFieldsFile, "snowflake-fields", snowflakeFieldsFile, "snowflake fields file")
+	flag.IntVar(&numWorkers, "workers", numWorkers, "number of workers")
 }
 
 func main() {
@@ -55,9 +60,9 @@ func main() {
 		addSnowflakeFieldsFile(string(b))
 	}
 
-	if err := scrapeDocs(); err != nil {
-		log.Fatalln(err)
-	}
+	// if err := scrapeDocs(); err != nil {
+	// 	log.Fatalln(err)
+	// }
 
 	openapiJSON, err := os.ReadFile(openapiFile)
 	if err != nil {

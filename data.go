@@ -28,7 +28,7 @@ var snowflakeFields = map[string]string{}
 
 func addSnowflakeFieldsFile(file string) {
 	for _, line := range strings.Split(file, "\n") {
-		if strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		values := strings.Fields(line)

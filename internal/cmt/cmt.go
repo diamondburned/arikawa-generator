@@ -1,6 +1,7 @@
 package cmt
 
 import (
+	"go/doc"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -8,6 +9,8 @@ import (
 
 type Opts struct {
 	OriginalName string
+	Indent       int
+	NoWrap       bool
 }
 
 func Prettify(self, cmt string, opts Opts) string {
@@ -42,6 +45,16 @@ func Prettify(self, cmt string, opts Opts) string {
 	}
 
 	cmt = addPeriod(cmt)
+
+	if opts.NoWrap {
+		lines := strings.Split(cmt, "\n")
+		for i, line := range lines {
+			lines[i] = "// " + line
+		}
+		cmt = strings.Join(lines, "\n") + "\n"
+	} else {
+		cmt = wrapComment(cmt, opts.Indent)
+	}
 
 	return cmt
 }
@@ -98,8 +111,18 @@ func lowerFirstLetter(p string) string {
 }
 
 func addPeriod(cmt string) string {
-	if cmt != "" && !strings.HasSuffix(cmt, ".") {
+	if cmt != "" && !strings.HasSuffix(cmt, "\n") && !strings.HasSuffix(cmt, ".") {
 		cmt += "."
 	}
 	return cmt
+}
+
+func wrapComment(text string, level int) string {
+	indentWidth := level*4 + len("// ")
+	indentStr := strings.Repeat(" ", indentWidth)
+	indentStr += "// "
+
+	var s strings.Builder
+	doc.ToText(&s, text, indentStr, "    ", 80-indentWidth)
+	return s.String()
 }
